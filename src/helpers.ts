@@ -9,9 +9,7 @@ export const generateCreateRouterImport = (
 ) => {
   sourceFile.addImportDeclaration({
     moduleSpecifier: './helpers/createRouter',
-    namedImports: [
-      isProtectedMiddleware ? 'createProtectedRouter' : 'createRouter',
-    ],
+    namedImports: ['router', 'publicProcedure'],
   });
 };
 
@@ -44,33 +42,13 @@ export const generateRouterImport = (
 };
 
 export function generateBaseRouter(sourceFile: SourceFile, config: Config) {
-  sourceFile.addStatements(/* ts */ `
-  import { Context } from '${config.contextPath}';
-    
-  export function createRouter() {
-    return trpc.router<Context>();
-  }`);
+  sourceFile.addStatements(/* ts */ `import { initTRPC } from '@trpc/server';
 
-  const middlewares = [];
-  if (config.withMiddleware) {
-    middlewares.push(/* ts */ `
-    .middleware(({ ctx, next }) => {
-      console.log("inside middleware!")
-      return next();
-    })`);
-  }
-
-  if (config.withShield) {
-    middlewares.push(/* ts */ `
-    .middleware(permissions)`);
-  }
-
-  sourceFile.addStatements(/* ts */ `
-    export function createProtectedRouter() {
-      return trpc
-        .router<Context>()
-        ${middlewares.join('\r')};
-    }`);
+  const t = initTRPC.create();
+  export const middleware = t.middleware;
+  export const router = t.router;
+  export const publicProcedure = t.procedure;
+  `);
 }
 
 export function generateProcedure(
@@ -82,15 +60,14 @@ export function generateProcedure(
   baseOpType: string,
 ) {
   sourceFile.addStatements(/* ts */ `
-  .${getProcedureTypeByOpName(baseOpType)}("${name}", {
-    input: ${typeName},
-    async resolve({ ctx, input }) {
-      const ${name} = await ctx.prisma.${uncapitalizeFirstLetter(
+  ${name}: publicProcedure
+    .input(${typeName})
+    .${getProcedureTypeByOpName(baseOpType)}(async ({ ctx, input }) => {
+      const ${name} = await prisma.${uncapitalizeFirstLetter(
     modelName,
   )}.${opType.replace('One', '')}(input);
       return ${name};
-    },
-  })`);
+    }),`);
 }
 
 export function generateRouterSchemaImports(
@@ -203,6 +180,33 @@ export const getProcedureTypeByOpName = (opName: string) => {
     case 'updateMany':
     case 'upsertOne':
       procType = 'mutation';
+      break;
+    default:
+      console.log('getProcedureTypeByOpName: ', { opName });
+  }
+  return procType;
+};
+
+export const getTrpcProcedureTypeByOpName = (opName: string) => {
+  let procType;
+  switch (opName) {
+    case 'findUnique':
+    case 'findFirst':
+    case 'findMany':
+    case 'findRaw':
+    case 'aggregate':
+    case 'aggregateRaw':
+    case 'groupBy':
+      procType = 'query';
+      break;
+    case 'createOne':
+    case 'createMany':
+    case 'deleteOne':
+    case 'updateOne':
+    case 'deleteMany':
+    case 'updateMany':
+    case 'upsertOne':
+      procType = 'mutate';
       break;
     default:
       console.log('getProcedureTypeByOpName: ', { opName });

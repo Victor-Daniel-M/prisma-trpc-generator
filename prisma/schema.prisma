@@ -3,7 +3,7 @@ generator client {
 }
 
 generator trpc {
-  provider          = "node ./lib/generator.js"
+  provider          = "ts-node ./src/generator.ts"
   isGenerateSelect  = true
   isGenerateInclude = true
 }

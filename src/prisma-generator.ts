@@ -15,10 +15,12 @@ import {
   generateShieldImport,
   generatetRPCImport,
   getInputTypeByOpName,
-  resolveModelsComments
+  getTrpcProcedureTypeByOpName,
+  resolveModelsComments,
 } from './helpers';
 import { project } from './project';
 import removeDir from './utils/removeDir';
+import { capitalizeFirstLetter } from './utils/uncapitalizeFirstLetter';
 
 export async function generate(options: GeneratorOptions) {
   const outputDir = parseEnvValue(options.generator.output as EnvValue);
@@ -81,10 +83,6 @@ export async function generate(options: GeneratorOptions) {
     { overwrite: true },
   );
 
-  generatetRPCImport(createRouter);
-  if (config.withShield) {
-    generateShieldImport(createRouter, shieldOutputPath);
-  }
   generateBaseRouter(createRouter, config);
 
   createRouter.formatText({
@@ -97,11 +95,175 @@ export async function generate(options: GeneratorOptions) {
     { overwrite: true },
   );
 
+  const trpc = project.createSourceFile(
+    path.resolve(outputDir, 'trpc', `index.ts`),
+    undefined,
+    { overwrite: true },
+  );
+
+  trpc.addStatements(`
+  import { createTRPCProxyClient, httpBatchLink } from '@trpc/client';
+  import { AppRouter } from '../routers';
+  import {
+    SERVER_BACKEND_API_PREFIX,
+    SERVER_BACKEND_HOST,
+    SERVER_BACKEND_PORT,
+  } from '../../../constants';
+  import fetch from 'node-fetch';
+  import AbortController from 'abort-controller';
+  import { SERVER_BACKEND_PROTOCOL } from '../../../constants';
+  import * as trpc from '@trpc/server';
+  import * as trpcExpress from '@trpc/server/adapters/express';
+  import {
+    PrismaClient,
+    Prisma,
+  } from '../../../prisma/node_modules/@prisma/try-oop';
+  
+  // @ts-ignore
+  global.AbortController = AbortController;
+  global.fetch = fetch as any;
+  
+  export const trpcClient = createTRPCProxyClient<AppRouter>({
+    links: [
+      httpBatchLink({
+        url: \`\${SERVER_BACKEND_PROTOCOL}://\${SERVER_BACKEND_HOST!}\${SERVER_BACKEND_PORT}/\${SERVER_BACKEND_API_PREFIX}\`,
+      }),
+    ],
+  });
+  
+  let prisma: PrismaClient = new PrismaClient();
+  
+  export const createContext = async (
+    opts?: trpcExpress.CreateExpressContextOptions
+  ) => {
+    const req = opts?.req;
+    const res = opts?.res;
+  
+    return {
+      prisma,
+      req,
+      res,
+    };
+  };
+  
+  export { prisma, Prisma };
+  export type Context = trpc.inferAsyncReturnType<typeof createContext>;
+  
+  export type TrpcClientType = typeof trpcClient;
+  
+
+  `);
+
+  const commands = project.createSourceFile(
+    path.resolve(outputDir, 'command', `index.ts`),
+    undefined,
+    { overwrite: true },
+  );
+
+  commands.addStatements(`
+  export function commandMethodName() {
+    try {
+      throw new Error();
+    } catch (e) {
+      try {
+        // second function --> command execute
+        return e.stack.split('at ')[4].split(' ')[0].split('.')[1];
+      } catch (e) {
+        return '';
+      }
+    }
+  }
+
+  export abstract class Command<T> {
+    key?: string;
+    data?: T;
+    execute(data: T): any {}
+    setData?(data: T): any {}
+    undo(): any {}
+    redo(): any {}
+    logCommand?() {}
+    logAction?() {}
+    logActionFailed?() {}
+    logActionDone?() {}
+  }
+  
+  export class BaseCommand {
+    logCommand() {
+      const commandMethodNameString = commandMethodName();
+  
+      const actionMap: { [key in typeof commandMethodNameString]: string } = {
+        execute: 'Executing',
+        redo: 'Redoing',
+        undo: 'Undoing',
+      };
+  
+      const processName =
+        actionMap[commandMethodNameString] || commandMethodNameString;
+      const commandName = this.constructor.name;
+  
+      return { processName, commandName };
+    }
+  
+    logAction() {
+      const { processName, commandName } = this.logCommand();
+      console.log(\`\${processName} \${commandName}...\`);
+    }
+  
+    logActionFailed() {
+      const { processName, commandName } = this.logCommand();
+      console.log(\`\${processName} \${commandName} Failed\`);
+    }
+  
+    logActionDone() {
+      const { processName, commandName } = this.logCommand();
+      console.log(\`\${processName} \${commandName} Done\`);
+    }
+  }
+  
+  export class BatchCommand<T> implements Command<any> {
+    key: string = 'batch';
+    data: T;
+    resState: any = {};
+    private commands: Command<any>[] = [];
+    private completedCommands: Command<any>[] = [];
+  
+    constructor(commands: Command<any>[], data: T) {
+      this.commands = commands;
+      this.data = data;
+    }
+  
+    async execute() {
+      for (const command of this.commands) {
+        const res = await command.execute(this.data);
+  
+        this.resState = { ...this.resState, ...{ [command.key!]: res } };
+  
+        this.completedCommands.push(command);
+      }
+  
+      return this.resState;
+    }
+  
+    async undo(): Promise<void> {
+      for (const command of this.completedCommands.reverse()) {
+        await command.undo();
+      }
+    }
+  
+    async redo(): Promise<void> {
+      for (const command of this.commands) {
+        await command.redo();
+      }
+    }
+  }
+  
+  `);
+
   generateCreateRouterImport(appRouter, config.withMiddleware);
   appRouter.addStatements(/* ts */ `
-  export const appRouter = ${
-    config.withMiddleware ? 'createProtectedRouter' : 'createRouter'
-  }()`);
+  import { inferRouterInputs, inferRouterOutputs } from '@trpc/server';
+
+  export const appRouter = ${'router'}({`);
 
   for (const modelOperation of modelOperations) {
     const { model, ...operations } = modelOperation;
@@ -114,6 +276,17 @@ export async function generate(options: GeneratorOptions) {
       undefined,
       { overwrite: true },
     );
+    const modelCommand = project.createSourceFile(
+      path.resolve(outputDir, 'routers', `${model}.command.ts`),
+      undefined,
+      { overwrite: true },
+    );
+
+    modelCommand.addStatements(
+      `import { RouteInput } from ".";
+      import { BaseCommand, Command } from "../command";
+      import { trpcClient } from "../trpc";`,
+    );
 
     generateCreateRouterImport(modelRouter, false);
     generateRouterSchemaImports(
@@ -124,7 +297,9 @@ export async function generate(options: GeneratorOptions) {
     );
 
     modelRouter.addStatements(/* ts */ `
-      export const ${plural}Router = createRouter()`);
+    import { prisma } from "../trpc";
+
+      export const ${plural}Router = router({`);
     for (const [opType, opNameWithModel] of Object.entries(operations)) {
       const baseOpType = opType.replace('OrThrow', '');
 
@@ -136,11 +311,63 @@ export async function generate(options: GeneratorOptions) {
         opType,
         baseOpType,
       );
+
+      modelCommand.addStatements(/* ts */ `
+      export class ${capitalizeFirstLetter(opNameWithModel)}Command<T>
+      extends BaseCommand
+      implements Command<any>
+    {
+      constructor(public data?: RouteInput<'${model.toLowerCase()}', '${opNameWithModel}'>) {
+        super();
+      }
+    
+      async setData(data: typeof this.data) {
+        this.data = data;
+      }
+    
+      async logAction() {
+        super.logAction();
+      }
+    
+      async execute() {
+        super.logAction();
+        return await trpcClient.${model.toLowerCase()}.${opNameWithModel}.${getTrpcProcedureTypeByOpName(
+        baseOpType,
+      )}(this.data!);
+      }
+    
+      async undo() {
+        super.logAction();
+      }
+    
+      async redo() {
+        super.logAction();
+      }
     }
+      `);
+    }
+    modelRouter.addStatements(/* ts */ `})`);
     modelRouter.formatText({ indentSize: 2 });
-    appRouter.addStatements(/* ts */ `
-      .merge('${model.toLowerCase()}.', ${plural}Router)`);
+    appRouter.addStatements(`${model.toLowerCase()}: ${plural}Router,`);
   }
+  appRouter.addStatements(`})
+  
+  export type AppRouter = typeof appRouter;
+
+  export type TRoute = keyof AppRouter['_def']['procedures'];
+  type Input = inferRouterInputs<AppRouter>;
+  type Output = inferRouterOutputs<AppRouter>;
+
+  export type RouteInput<
+    TRouteName extends TRoute,
+    T extends keyof Input[TRouteName]
+  > = Input[TRouteName][T];
+  export type RouterOutput<
+    TRouteName extends TRoute,
+    T extends keyof Output[TRouteName]
+  > = Output[TRouteName][T];
+
+  `);
 
   appRouter.formatText({ indentSize: 2 });
   await project.save();
